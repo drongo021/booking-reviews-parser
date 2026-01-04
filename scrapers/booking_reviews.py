@@ -1,6 +1,6 @@
 """
 Booking.com Reviews Parser
-Парсит последние отзывы из Booking.com используя Selenium
+Парсит последние отзывы из Booking.com используя GraphQL API или Selenium (fallback)
 """
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -14,6 +14,7 @@ import os
 import platform
 import time
 import re
+import json
 import logging
 from typing import List, Dict
 
@@ -381,6 +382,76 @@ def _extract_review_data(review_element):
     return review_data
 
 
+def _intercept_graphql_requests(driver, booking_url, max_reviews):
+    """Перехватывает GraphQL запросы, которые делает страница"""
+    reviews = []
+    try:
+        # Включаем логирование Network requests
+        driver.execute_cdp_cmd('Network.enable', {})
+        
+        # Переходим на страницу
+        driver.get(booking_url)
+        time.sleep(5)
+        
+        # Получаем логи Network
+        logs = driver.get_log('performance')
+        
+        for log in logs:
+            message = json.loads(log['message'])['message']
+            if message['method'] == 'Network.responseReceived':
+                response = message['params']['response']
+                url = response.get('url', '')
+                
+                # Ищем GraphQL запросы
+                if 'graphql' in url.lower() or 'api' in url.lower():
+                    request_id = message['params']['requestId']
+                    try:
+                        response_body = driver.execute_cdp_cmd('Network.getResponseBody', {'requestId': request_id})
+                        if response_body and 'reviews' in response_body.get('body', '').lower():
+                            data = json.loads(response_body['body'])
+                            # Извлекаем отзывы из ответа
+                            # Структура зависит от конкретного API
+                            reviews.extend(_extract_reviews_from_graphql_response(data))
+                            if len(reviews) >= max_reviews:
+                                break
+                    except:
+                        continue
+        
+        driver.execute_cdp_cmd('Network.disable', {})
+    except Exception as e:
+        logger.debug(f"GraphQL interception failed: {e}")
+    
+    return reviews
+
+def _extract_reviews_from_graphql_response(data):
+    """Извлекает отзывы из GraphQL ответа"""
+    reviews = []
+    try:
+        # Пытаемся найти отзывы в различных структурах ответа
+        if isinstance(data, dict):
+            # Различные возможные пути к данным
+            paths = [
+                ['data', 'hotel', 'reviews'],
+                ['data', 'reviews'],
+                ['reviews'],
+                ['data', 'getHotelReviews', 'reviews'],
+            ]
+            
+            for path in paths:
+                current = data
+                try:
+                    for key in path:
+                        current = current[key]
+                    if isinstance(current, list):
+                        reviews = current
+                        break
+                except (KeyError, TypeError):
+                    continue
+    except Exception as e:
+        logger.debug(f"Error extracting reviews from GraphQL response: {e}")
+    
+    return reviews
+
 def parse_booking_reviews(booking_url: str, max_reviews: int = 10) -> List[Dict]:
     """
     Парсит отзывы из Booking.com
@@ -396,6 +467,14 @@ def parse_booking_reviews(booking_url: str, max_reviews: int = 10) -> List[Dict]
     try:
         logger.info(f"Starting to parse reviews from: {booking_url}")
         driver = _setup_driver()
+        
+        # Включаем Network logging для перехвата GraphQL запросов
+        try:
+            driver.execute_cdp_cmd('Network.enable', {})
+            logger.info("Network logging enabled for GraphQL interception")
+        except Exception as e:
+            logger.debug(f"Could not enable Network logging: {e}")
+        
         driver.get(booking_url)
         time.sleep(5)  # Увеличили время ожидания
         
@@ -409,12 +488,64 @@ def parse_booking_reviews(booking_url: str, max_reviews: int = 10) -> List[Dict]
         # Дополнительное ожидание после навигации
         time.sleep(3)
         
-        # Прокрутить для загрузки
+        # Прокрутить для загрузки (это может инициировать GraphQL запросы)
         _scroll_to_load_reviews(driver, max_reviews)
+        time.sleep(2)  # Дополнительное ожидание для завершения GraphQL запросов
         
+        # Пытаемся перехватить GraphQL запросы
+        reviews_from_graphql = []
+        try:
+            logs = driver.get_log('performance')
+            for log in logs:
+                try:
+                    message = json.loads(log['message'])['message']
+                    if message.get('method') == 'Network.responseReceived':
+                        response = message['params'].get('response', {})
+                        url = response.get('url', '')
+                        # Ищем GraphQL или API запросы с отзывами
+                        if any(keyword in url.lower() for keyword in ['graphql', '/api/', 'reviews']):
+                            request_id = message['params']['requestId']
+                            try:
+                                response_body = driver.execute_cdp_cmd('Network.getResponseBody', {'requestId': request_id})
+                                body = response_body.get('body', '')
+                                if body and ('review' in body.lower() or 'rating' in body.lower()):
+                                    data = json.loads(body)
+                                    extracted = _extract_reviews_from_graphql_response(data)
+                                    if extracted:
+                                        reviews_from_graphql.extend(extracted)
+                                        logger.info(f"Found {len(extracted)} reviews in GraphQL/API response from {url}")
+                                        if len(reviews_from_graphql) >= max_reviews:
+                                            break
+                            except Exception as e:
+                                logger.debug(f"Error reading GraphQL response: {e}")
+                                continue
+                except Exception as e:
+                    logger.debug(f"Error processing network log: {e}")
+                    continue
+        except Exception as e:
+            logger.debug(f"GraphQL interception failed: {e}")
+        
+        # Если нашли отзывы через GraphQL, преобразуем их в нужный формат и возвращаем
+        if len(reviews_from_graphql) > 0:
+            formatted_reviews = []
+            for review in reviews_from_graphql[:max_reviews]:
+                if isinstance(review, dict):
+                    formatted_reviews.append({
+                        "text": review.get("text", review.get("comment", review.get("message", ""))),
+                        "rating": review.get("rating", review.get("score")),
+                        "author": review.get("author", review.get("guest_name", review.get("name", ""))),
+                        "country": review.get("country", review.get("guest_country", "")),
+                        "date": review.get("date", review.get("created_at", review.get("review_date", ""))),
+                        "room_type": review.get("room_type", review.get("room", "")),
+                        "stay_duration": review.get("stay_duration", review.get("nights", "")),
+                    })
+            logger.info(f"Successfully parsed {len(formatted_reviews)} reviews via GraphQL/API")
+            return formatted_reviews
+        
+        # Fallback: используем DOM парсинг
         # Найти все отзывы используя различные селекторы
         review_elements = _find_review_elements(driver)
-        logger.info(f"Found {len(review_elements)} review elements")
+        logger.info(f"Found {len(review_elements)} review elements via DOM")
         
         # Если отзывы не найдены, попробуем найти любые элементы с текстом отзывов
         if len(review_elements) == 0:
