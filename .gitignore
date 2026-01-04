@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv
+
+# Environment
+.env
+*.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# Railway
+.railway/
+
+# Test files
+test_parser.py
+test_result_example.json
+
+# Selenium
+chromedriver
+geckodriver
+
+# OS
+.DS_Store
+Thumbs.db
+
