@@ -135,24 +135,65 @@ def _navigate_to_reviews(driver, booking_url):
         logger.debug(f"Could not click reviews link: {e}")
 
 
+def _find_review_elements(driver):
+    """Находит элементы отзывов используя различные селекторы"""
+    review_selectors = [
+        "div[data-testid='review']",
+        "div[data-testid='review-item']",
+        "div.review-item",
+        "div.c-review",
+        "div[class*='review']",
+        "div[class*='Review']",
+        "article[data-testid='review']",
+        "li[data-testid='review']",
+        "div.review_list_item",
+        "div.review_item",
+        "div.review-block",
+        "div.review-item-block",
+        "div[itemprop='review']",
+        "div.review_body",
+    ]
+    
+    for selector in review_selectors:
+        try:
+            elements = driver.find_elements(By.CSS_SELECTOR, selector)
+            if len(elements) > 0:
+                logger.info(f"Found {len(elements)} reviews using selector: {selector}")
+                return elements
+        except:
+            continue
+    
+    return []
+
 def _scroll_to_load_reviews(driver, max_reviews):
     """Прокрутка страницы для загрузки отзывов (lazy loading)"""
-    for i in range(5):
+    for i in range(8):  # Увеличили количество попыток
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(2)
+        
         # Проверка, сколько отзывов загружено
-        try:
-            reviews = driver.find_elements(By.CSS_SELECTOR, "div[data-testid='review']")
-            if len(reviews) >= max_reviews:
-                logger.info(f"Loaded {len(reviews)} reviews")
-                break
-        except:
-            pass
+        reviews = _find_review_elements(driver)
+        if len(reviews) >= max_reviews:
+            logger.info(f"Loaded {len(reviews)} reviews")
+            break
+        
         # Дополнительная прокрутка к элементу отзывов
         try:
-            review_section = driver.find_element(By.CSS_SELECTOR, "[data-testid='reviews']")
-            driver.execute_script("arguments[0].scrollIntoView(true);", review_section)
-            time.sleep(2)
+            review_section_selectors = [
+                "[data-testid='reviews']",
+                "#review_list_page",
+                ".review_list",
+                "[id*='review']",
+                "[class*='review-list']"
+            ]
+            for selector in review_section_selectors:
+                try:
+                    review_section = driver.find_element(By.CSS_SELECTOR, selector)
+                    driver.execute_script("arguments[0].scrollIntoView(true);", review_section)
+                    time.sleep(2)
+                    break
+                except:
+                    continue
         except:
             pass
 
@@ -355,20 +396,36 @@ def parse_booking_reviews(booking_url: str, max_reviews: int = 10) -> List[Dict]
         logger.info(f"Starting to parse reviews from: {booking_url}")
         driver = _setup_driver()
         driver.get(booking_url)
-        time.sleep(3)
+        time.sleep(5)  # Увеличили время ожидания
         
         # Закрыть cookie баннер
         _close_cookie_banner(driver)
+        time.sleep(2)
         
         # Перейти к отзывам
         _navigate_to_reviews(driver, booking_url)
         
+        # Дополнительное ожидание после навигации
+        time.sleep(3)
+        
         # Прокрутить для загрузки
         _scroll_to_load_reviews(driver, max_reviews)
         
-        # Найти все отзывы
-        review_elements = driver.find_elements(By.CSS_SELECTOR, "div[data-testid='review']")
+        # Найти все отзывы используя различные селекторы
+        review_elements = _find_review_elements(driver)
         logger.info(f"Found {len(review_elements)} review elements")
+        
+        # Если отзывы не найдены, попробуем найти любые элементы с текстом отзывов
+        if len(review_elements) == 0:
+            logger.warning("No reviews found with standard selectors, trying alternative approach...")
+            try:
+                # Попробуем найти элементы по классам, содержащим "review"
+                all_review_candidates = driver.find_elements(By.XPATH, "//div[contains(@class, 'review') or contains(@class, 'Review')]")
+                logger.info(f"Found {len(all_review_candidates)} candidate elements with 'review' in class")
+                if len(all_review_candidates) > 0:
+                    review_elements = all_review_candidates[:max_reviews * 3]  # Берем больше кандидатов
+            except Exception as e:
+                logger.debug(f"Alternative search failed: {e}")
         
         reviews = []
         for idx, elem in enumerate(review_elements[:max_reviews * 2]):  # Берем больше, чтобы отфильтровать пустые
