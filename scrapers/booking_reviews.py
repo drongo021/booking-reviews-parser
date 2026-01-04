@@ -492,38 +492,90 @@ def parse_booking_reviews(booking_url: str, max_reviews: int = 10) -> List[Dict]
         _scroll_to_load_reviews(driver, max_reviews)
         time.sleep(2)  # Дополнительное ожидание для завершения GraphQL запросов
         
-        # Пытаемся перехватить GraphQL запросы
+        # Пытаемся перехватить GraphQL запросы с детальным логированием
         reviews_from_graphql = []
+        all_network_requests = []
         try:
             logs = driver.get_log('performance')
+            logger.info(f"Total performance logs: {len(logs)}")
+            
             for log in logs:
                 try:
                     message = json.loads(log['message'])['message']
-                    if message.get('method') == 'Network.responseReceived':
+                    method = message.get('method', '')
+                    
+                    # Логируем все Network запросы для анализа
+                    if method == 'Network.requestWillBeSent':
+                        request_data = message['params'].get('request', {})
+                        url = request_data.get('url', '')
+                        method_type = request_data.get('method', '')
+                        # Логируем только потенциально интересные запросы
+                        if any(keyword in url.lower() for keyword in ['api', 'graphql', 'review', 'hotel', 'data', 'json']):
+                            logger.info(f"[NETWORK REQUEST] {method_type} {url}")
+                            all_network_requests.append({
+                                'type': 'request',
+                                'method': method_type,
+                                'url': url
+                            })
+                    
+                    if method == 'Network.responseReceived':
                         response = message['params'].get('response', {})
                         url = response.get('url', '')
-                        # Ищем GraphQL или API запросы с отзывами
-                        if any(keyword in url.lower() for keyword in ['graphql', '/api/', 'reviews']):
-                            request_id = message['params']['requestId']
-                            try:
-                                response_body = driver.execute_cdp_cmd('Network.getResponseBody', {'requestId': request_id})
-                                body = response_body.get('body', '')
-                                if body and ('review' in body.lower() or 'rating' in body.lower()):
-                                    data = json.loads(body)
-                                    extracted = _extract_reviews_from_graphql_response(data)
-                                    if extracted:
-                                        reviews_from_graphql.extend(extracted)
-                                        logger.info(f"Found {len(extracted)} reviews in GraphQL/API response from {url}")
-                                        if len(reviews_from_graphql) >= max_reviews:
-                                            break
-                            except Exception as e:
-                                logger.debug(f"Error reading GraphQL response: {e}")
-                                continue
+                        status = response.get('status', 0)
+                        mime_type = response.get('mimeType', '')
+                        
+                        # Логируем все ответы с JSON или потенциально интересные
+                        if 'json' in mime_type.lower() or any(keyword in url.lower() for keyword in ['api', 'graphql', 'review', 'hotel', 'data']):
+                            logger.info(f"[NETWORK RESPONSE] {status} {mime_type} {url}")
+                            all_network_requests.append({
+                                'type': 'response',
+                                'status': status,
+                                'mime_type': mime_type,
+                                'url': url
+                            })
+                            
+                            # Если это JSON ответ, пытаемся прочитать его
+                            if 'json' in mime_type.lower():
+                                request_id = message['params']['requestId']
+                                try:
+                                    response_body = driver.execute_cdp_cmd('Network.getResponseBody', {'requestId': request_id})
+                                    body = response_body.get('body', '')
+                                    
+                                    if body:
+                                        logger.info(f"[RESPONSE BODY] URL: {url}")
+                                        logger.info(f"[RESPONSE BODY] Length: {len(body)} bytes")
+                                        
+                                        # Пытаемся распарсить JSON
+                                        try:
+                                            data = json.loads(body)
+                                            # Логируем структуру (первые уровни)
+                                            logger.info(f"[RESPONSE STRUCTURE] Keys: {list(data.keys())[:10] if isinstance(data, dict) else 'Not a dict'}")
+                                            
+                                            # Ищем отзывы
+                                            if 'review' in body.lower() or 'rating' in body.lower():
+                                                logger.info(f"[REVIEWS DETECTED] Found 'review' or 'rating' in response body")
+                                                extracted = _extract_reviews_from_graphql_response(data)
+                                                if extracted:
+                                                    reviews_from_graphql.extend(extracted)
+                                                    logger.info(f"[SUCCESS] Found {len(extracted)} reviews in response from {url}")
+                                                    if len(reviews_from_graphql) >= max_reviews:
+                                                        break
+                                                else:
+                                                    logger.info(f"[NO REVIEWS] Could not extract reviews from response structure")
+                                        except json.JSONDecodeError:
+                                            logger.debug(f"[NOT JSON] Response is not valid JSON")
+                                except Exception as e:
+                                    logger.debug(f"Error reading response body for {url}: {e}")
+                                    continue
                 except Exception as e:
                     logger.debug(f"Error processing network log: {e}")
                     continue
+            
+            logger.info(f"[NETWORK SUMMARY] Total interesting requests/responses: {len(all_network_requests)}")
+            if len(reviews_from_graphql) == 0:
+                logger.warning(f"[NO GRAPHQL REVIEWS] Could not find reviews in any network responses")
         except Exception as e:
-            logger.debug(f"GraphQL interception failed: {e}")
+            logger.error(f"GraphQL interception failed: {e}", exc_info=True)
         
         # Если нашли отзывы через GraphQL, преобразуем их в нужный формат и возвращаем
         if len(reviews_from_graphql) > 0:
