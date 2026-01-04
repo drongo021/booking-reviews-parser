@@ -62,6 +62,6 @@ COPY . .
 # Открытие порта
 EXPOSE 5000
 
-# Запуск приложения
-CMD ["sh", "-c", "gunicorn app:app --bind 0.0.0.0:${PORT:-5000} --workers 2 --timeout 120"]
+# Запуск приложения (shell форма для подстановки переменных окружения)
+CMD gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
 
